@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import logging
 import requests
 import pandas as pd
 from datetime import datetime
@@ -15,15 +16,27 @@ NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
 SPREADSHEET_NAME = "Enriched CVEs.xlsx"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# --- CVE Color Mapping ---
-CRITICAL_FILL = PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid")  # Dark Red
-HIGH_FILL = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")  # Red
-MEDIUM_FILL = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")  # Orange
-LOW_FILL = PatternFill(start_color="008000", end_color="008000", fill_type="solid")  # Green
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- NVD API Key (replace with your key or set as an environment variable) ---
+NVD_API_KEY = os.getenv('NVD_API_KEY', "YOUR_API_KEY_GOES_HERE")
+
+# --- Throttling Configuration ---
+INITIAL_WORKERS = 3  # Start with 3 threads max
+g_request_delay = 5.0 # Start with 1 call every 5 seconds per thread
+
+# --- Color Mapping ---
+CRITICAL_FILL = PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid")
+HIGH_FILL = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+MEDIUM_FILL = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+LOW_FILL = PatternFill(start_color="008000", end_color="008000", fill_type="solid")
+
+class RateLimitException(Exception):
+    pass
 
 def get_color_for_score(score):
-    """Returns the color fill for a given CVSS score."""
-    if score is None:
+    if score is None or not isinstance(score, (int, float)):
         return None
     if 9.0 <= score <= 10.0:
         return CRITICAL_FILL
@@ -36,7 +49,6 @@ def get_color_for_score(score):
     return None
 
 def get_color_for_severity(severity):
-    """Returns the color fill for a given CVSS severity."""
     if severity is None:
         return None
     severity = severity.upper()
@@ -50,129 +62,208 @@ def get_color_for_severity(severity):
         return LOW_FILL
     return None
 
-def fetch_nvd_data(cve_id, retries=3, delay=5):
-    """Fetches CVSS score and severity from the NVD API for a given CVE ID."""
-    for attempt in range(retries):
-        try:
-            response = requests.get(NVD_API_URL.format(cve_id=cve_id), timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            if 'vulnerabilities' in data and data['vulnerabilities']:
-                cve_data = data['vulnerabilities'][0]['cve']
-                if 'metrics' in cve_data and 'cvssMetricV31' in cve_data['metrics']:
-                    cvss_data = cve_data['metrics']['cvssMetricV31'][0]['cvssData']
-                    return cvss_data.get('baseScore'), cvss_data.get('baseSeverity')
-            return None, None
-        except requests.exceptions.RequestException as e:
-            print(f"Warning: Request for {cve_id} failed (attempt {attempt + 1}/{retries}): {e}")
-            time.sleep(delay)
-    return None, None
+def fetch_nvd_data(cve_id):
+    # Politeness delay added before every request
+    time.sleep(g_request_delay)
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+    }
+    if NVD_API_KEY and NVD_API_KEY != "YOUR_API_KEY_GOES_HERE":
+        headers['apiKey'] = NVD_API_KEY
+
+    try:
+        response = requests.get(NVD_API_URL.format(cve_id=cve_id), headers=headers, timeout=20)
+        if response.status_code == 429:
+            raise RateLimitException(f"Rate limit hit for {cve_id}")
+        if response.status_code == 404:
+            return cve_id, "N/A", "N/A", "N/A"
+
+        response.raise_for_status()
+        data = response.json()
+
+        vulnerabilities = data.get("vulnerabilities")
+        if not vulnerabilities:
+            return cve_id, "N/A", "N/A", "N/A"
+
+        cve_data = vulnerabilities[0].get("cve", {})
+        published_date = cve_data.get("published", "N/A").split('T')[0]
+
+        metrics = cve_data.get("metrics", {})
+        cvss_metrics = None
+
+        if "cvssMetricV31" in metrics:
+            cvss_metrics = metrics.get("cvssMetricV31")
+        elif "cvssMetricV30" in metrics:
+            cvss_metrics = metrics.get("cvssMetricV30")
+
+        cvss_score = "N/A"
+        cvss_severity = "N/A"
+
+        if cvss_metrics:
+            primary_metric = next((m for m in cvss_metrics if m.get("type") == "Primary"), None)
+
+            if primary_metric:
+                cvss_data = primary_metric.get("cvssData", {})
+                cvss_score = cvss_data.get("baseScore", "N/A")
+                cvss_severity = cvss_data.get("baseSeverity", "N/A")
+            elif cvss_metrics:
+                cvss_data = cvss_metrics[0].get("cvssData", {})
+                cvss_score = cvss_data.get("baseScore", "N/A")
+                cvss_severity = cvss_data.get("baseSeverity", "N/A")
+
+        return cve_id, cvss_score, cvss_severity, published_date
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request failed for {cve_id}: {e}")
+        return cve_id, "Error", "Error", "Error"
+    except Exception as e:
+        logging.error(f"Unexpected error processing {cve_id}: {e}")
+        return cve_id, "Error", "Error", "Error"
 
 def main():
-    """Main function to perform CVE enrichment."""
-    print("Starting the CVE enrichment process...")
+    global g_request_delay # Declare that we will modify the global delay variable
 
-    # --- 1. Check for existing spreadsheet ---
+    logging.info("Starting the CVE enrichment process...")
     existing_df = None
     if os.path.exists(SPREADSHEET_NAME):
-        print(f"Found existing spreadsheet: '{SPREADSHEET_NAME}'. It will be updated.")
+        logging.info(f"Found existing spreadsheet: '{SPREADSHEET_NAME}'. It will be updated.")
         try:
             existing_df = pd.read_excel(SPREADSHEET_NAME)
         except Exception as e:
-            print(f"Error reading existing spreadsheet: {e}. A new one will be created.")
+            logging.error(f"Error reading existing spreadsheet: {e}. A new one will be created.")
 
-    # --- 2. Download KEV list ---
-    print(f"Downloading KEV list from {KEV_URL}...")
+    logging.info(f"Downloading KEV list from {KEV_URL}...")
     try:
         response = requests.get(KEV_URL)
         response.raise_for_status()
         kev_data = response.json()
-        print("KEV list downloaded successfully.")
+        logging.info("KEV list downloaded successfully.")
     except requests.exceptions.RequestException as e:
-        print(f"Error downloading KEV list: {e}")
+        logging.error(f"Error downloading KEV list: {e}")
         return
 
-    # --- 3. Identify new CVEs ---
     kev_vulnerabilities = kev_data.get("vulnerabilities", [])
     if existing_df is not None:
         existing_cves = set(existing_df['CVE ID'])
-        new_vulnerabilities = [
-            vuln for vuln in kev_vulnerabilities if vuln.get("cveID") not in existing_cves
-        ]
-        if not new_vulnerabilities:
-            print("No new CVEs found in the KEV list. Exiting.")
+        cves_to_process = [vuln for vuln in kev_vulnerabilities if vuln.get("cveID") not in existing_cves]
+        if not cves_to_process:
+            logging.info("No new CVEs found in the KEV list. Exiting.")
             return
-        print(f"Found {len(new_vulnerabilities)} new CVEs to add.")
-        vulnerabilities_to_process = new_vulnerabilities
+        logging.info(f"Found {len(cves_to_process)} new CVEs to add.")
     else:
-        print(f"Processing {len(kev_vulnerabilities)} CVEs from the KEV list.")
-        vulnerabilities_to_process = kev_vulnerabilities
+        cves_to_process = kev_vulnerabilities
+        logging.info(f"Processing {len(cves_to_process)} CVEs from the KEV list.")
 
-    # --- 4 & 5. Prepare data for DataFrame ---
-    cve_rows = []
-    for vuln in vulnerabilities_to_process:
-        cve_rows.append({
+    new_cve_rows = {
+        vuln.get('cveID'): {
             'CVE ID': vuln.get('cveID'),
             'Vulnerability Name': vuln.get('vulnerabilityName'),
             'CVSS Score': None,
             'CVSS Severity': None,
-            'EPSS Score': None,  # Placeholder as EPSS is not in the KEV list
+            'Published Date': None,
+            'EPSS Score': None,
             'Vendor Project': vuln.get('vendorProject'),
             'Vendor Product': vuln.get('product'),
             'Date Added': vuln.get('dateAdded'),
-            'Due Date': vuln.get('dueDate')
-        })
+            'Due Date': vuln.get('dueDate'),
+            'NVD Status': 'Unknown'
+        } for vuln in cves_to_process
+    }
 
-    new_df = pd.DataFrame(cve_rows)
+    logging.info("Fetching CVSS data from NVD...")
+    cve_ids_to_fetch = list(new_cve_rows.keys())
+    current_workers = INITIAL_WORKERS
 
-    # --- 6. Fetch NVD data in parallel ---
-    print("Fetching CVSS data from NVD...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_nvd_data, cve_id): cve_id for cve_id in new_df['CVE ID']}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching NVD Data"):
-            cve_id = futures[future]
-            try:
-                score, severity = future.result()
-                if score is not None:
-                    new_df.loc[new_df['CVE ID'] == cve_id, 'CVSS Score'] = score
-                    new_df.loc[new_df['CVE ID'] == cve_id, 'CVSS Severity'] = severity
-            except Exception as e:
-                print(f"Error processing {cve_id}: {e}")
+    with tqdm(total=len(cve_ids_to_fetch), desc="Fetching NVD Data") as pbar:
+        while cve_ids_to_fetch:
+            rate_limit_hit = False
+            next_round_to_fetch = []
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                future_to_cve = {executor.submit(fetch_nvd_data, cve_id): cve_id for cve_id in cve_ids_to_fetch}
+                for future in as_completed(future_to_cve):
+                    cve_id = future_to_cve[future]
+                    try:
+                        cve_id_result, score, severity, published_date = future.result()
+                        new_cve_rows[cve_id]['Published Date'] = published_date
 
-    # --- Combine with existing data ---
+                        if score not in ["N/A", "Error"]:
+                            new_cve_rows[cve_id]['CVSS Score'] = score
+                            new_cve_rows[cve_id]['CVSS Severity'] = severity
+                            new_cve_rows[cve_id]['NVD Status'] = 'Published'
+                        else:
+                            new_cve_rows[cve_id]['NVD Status'] = 'Not Found' if score == "N/A" else "Error"
+                        pbar.update(1)
+                    except RateLimitException as e:
+                        logging.warning(f"{e}. Adding to retry queue.")
+                        rate_limit_hit = True
+                        next_round_to_fetch.append(cve_id)
+                    except Exception as e:
+                        logging.error(f"Unexpected error for {cve_id}: {e}")
+                        pbar.update(1)
+
+            if rate_limit_hit:
+                cve_ids_to_fetch = next_round_to_fetch
+                pbar.set_description(f"Rate limit hit! Retrying {len(cve_ids_to_fetch)} CVEs")
+
+                # --- START: New backoff logic ---
+                if g_request_delay < 10.0:
+                    g_request_delay = 10.0
+                    logging.warning(f"Increasing request delay to {g_request_delay} seconds.")
+
+                new_worker_count = max(1, int(current_workers * 0.8))
+
+                logging.warning(f"Backing down for 3 seconds...")
+                time.sleep(3)
+
+                if new_worker_count < current_workers:
+                    logging.warning(f"Reducing workers from {current_workers} to {new_worker_count}.")
+                current_workers = new_worker_count
+                # --- END: New backoff logic ---
+            else:
+                cve_ids_to_fetch = []
+
+    new_df = pd.DataFrame(list(new_cve_rows.values()))
+
     if existing_df is not None:
+        new_columns = {col: None for col in new_df.columns if col not in existing_df.columns}
+        existing_df = existing_df.assign(**new_columns)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
     else:
         combined_df = new_df
 
-    # --- Create and format the spreadsheet ---
-    print("Creating and formatting the spreadsheet...")
-    writer = pd.ExcelWriter(SPREADSHEET_NAME, engine='openpyxl')
-    combined_df.to_excel(writer, index=False, sheet_name='Enriched CVEs')
-    workbook = writer.book
-    worksheet = writer.sheets['Enriched CVEs']
+    logging.info("Creating and formatting the spreadsheet...")
+    with pd.ExcelWriter(SPREADSHEET_NAME, engine='openpyxl') as writer:
+        cols_order = ['CVE ID', 'Vulnerability Name', 'CVSS Score', 'CVSS Severity', 'Published Date',
+                      'EPSS Score', 'Vendor Project', 'Vendor Product', 'Date Added', 'Due Date', 'NVD Status']
+        cols_to_use = [col for col in cols_order if col in combined_df.columns]
+        combined_df = combined_df[cols_to_use]
 
-    # --- 7 & 8. Apply color formatting ---
-    for row_index, row in enumerate(combined_df.itertuples(), 2):
-        # Color CVSS Score
-        cvss_score_cell = worksheet.cell(row=row_index, column=combined_df.columns.get_loc('CVSS Score') + 1)
-        score_color = get_color_for_score(getattr(row, 'CVSS_Score', None))
-        if score_color:
-            cvss_score_cell.fill = score_color
+        combined_df.to_excel(writer, index=False, sheet_name='Enriched CVEs')
+        worksheet = writer.sheets['Enriched CVEs']
+        workbook = worksheet.parent
 
-        # Color CVSS Severity
-        cvss_severity_cell = worksheet.cell(row=row_index, column=combined_df.columns.get_loc('CVSS Severity') + 1)
-        severity_color = get_color_for_severity(getattr(row, 'CVSS_Severity', None))
-        if severity_color:
-            cvss_severity_cell.fill = severity_color
+        header_map = {col: i + 1 for i, col in enumerate(combined_df.columns)}
+        score_col_idx = header_map.get('CVSS Score')
+        severity_col_idx = header_map.get('CVSS Severity')
 
-    # --- 9. Add a timestamp ---
-    timestamp_sheet = workbook.create_sheet("Metadata")
-    timestamp_sheet['A1'] = "Last Updated"
-    timestamp_sheet['B1'] = datetime.now().strftime(TIMESTAMP_FORMAT)
+        for row_index, row in enumerate(combined_df.itertuples(), 2):
+            if score_col_idx:
+                score_color = get_color_for_score(getattr(row, 'CVSS_Score', None))
+                if score_color:
+                    worksheet.cell(row=row_index, column=score_col_idx).fill = score_color
+            if severity_col_idx:
+                severity_color = get_color_for_severity(getattr(row, 'CVSS_Severity', None))
+                if severity_color:
+                    worksheet.cell(row=row_index, column=severity_col_idx).fill = severity_color
 
-    writer.close()
-    print(f"Successfully created/updated '{SPREADSHEET_NAME}'")
+        timestamp_sheet = workbook.create_sheet("Metadata")
+        timestamp_sheet['A1'] = "Last Updated"
+        timestamp_sheet['B1'] = datetime.now().strftime(TIMESTAMP_FORMAT)
+
+    logging.info(f"Successfully created/updated '{SPREADSHEET_NAME}'")
 
 if __name__ == "__main__":
     main()
