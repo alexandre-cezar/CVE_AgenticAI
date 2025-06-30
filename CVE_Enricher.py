@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 NVD_API_KEY = os.getenv('NVD_API_KEY', "YOUR_API_KEY_GOES_HERE")
 
 # --- Throttling Configuration ---
-INITIAL_WORKERS = 3  # Start with 3 threads max
+INITIAL_WORKERS = 5  # Start with 5 threads max
 g_request_delay = 5.0 # Start with 1 call every 5 seconds per thread
 
 # --- Color Mapping ---

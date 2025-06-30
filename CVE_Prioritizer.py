@@ -22,7 +22,21 @@ REQUEST_DELAY = 5.0  # 1 call every 5 seconds per thread
 EPSS_RELEVANCE_WINDOW_DAYS = 30
 
 # --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# This will log messages to both your console and a file named 'prioritization.log'
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create file handler
+file_handler = logging.FileHandler("prioritization.log")
+file_handler.setFormatter(log_formatter)
+logger.addHandler(file_handler)
+
+# Create console handler
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(log_formatter)
+logger.addHandler(stream_handler)
+
 
 def fetch_epss_data(cve_id):
     """
