@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 # --- Configuration ---
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
+NVD_API_BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 SPREADSHEET_NAME = "Enriched CVEs.xlsx"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -66,12 +66,18 @@ def fetch_nvd_data(cve_id):
     if NVD_API_KEY and NVD_API_KEY != "YOUR_API_KEY_GOES_HERE":
         headers['apiKey'] = NVD_API_KEY
 
+    # Use a parameters dictionary for the request
+    params = {'cveId': cve_id}
+
     try:
-        response = requests.get(NVD_API_URL.format(cve_id=cve_id), headers=headers, timeout=20)
+        # Make the request using the base URL and params
+        response = requests.get(NVD_API_BASE_URL, params=params, headers=headers, timeout=20)
+
         if response.status_code == 429:
             raise RateLimitException(f"Rate limit hit for {cve_id}")
         if response.status_code == 404:
             return cve_id, None, None  # Not found
+
         response.raise_for_status()
         data = response.json()
         if 'vulnerabilities' in data and data['vulnerabilities']:
